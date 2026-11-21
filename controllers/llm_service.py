@@ -104,7 +104,7 @@ ANSWER:
                     "temperature": 0.1
                 }
             },
-            timeout=60
+            # timeout=180
         )
 
         response.raise_for_status()
