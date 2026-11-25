@@ -4,6 +4,7 @@ import logging
 import re
 from collections import Counter
 from math import ceil
+from typing import Any
 
 import pdfplumber
 import pymupdf
@@ -11,9 +12,9 @@ import pytesseract
 from PIL import Image
 
 
-# --------------------------------------------------
-# 1. LOGGING CONFIGURATION
-# --------------------------------------------------
+# ==================================================
+# 1. LOGGING
+# ==================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,23 +24,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------
-# 2. BASIC TEXT CLEANING
-# --------------------------------------------------
+# ==================================================
+# 2. TEXT CLEANING
+# ==================================================
 
 def clean_text(text: str) -> str:
-    """
-    Clean extracted PDF text while preserving
-    paragraph and line structure.
-    """
 
     if not text:
         return ""
 
-    text = text.replace("\r\n", "\n")
-    text = text.replace("\r", "\n")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # Join words broken by PDF line wrapping.
+    # Join words split by hyphen at line endings.
     text = re.sub(
         r"(?<=\w)-\n(?=[a-z])",
         "",
@@ -50,30 +46,32 @@ def clean_text(text: str) -> str:
 
     for line in text.split("\n"):
 
-        line = re.sub(r"[ \t]+", " ", line)
-        line = line.strip()
+        line = re.sub(r"[ \t]+", " ", line).strip()
 
         lines.append(line)
 
     text = "\n".join(lines)
 
-    text = re.sub(
-        r"\n{3,}",
-        "\n\n",
-        text
-    )
+    text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
 
 
-# --------------------------------------------------
-# 3. HEADING AND SUBJECT DETECTION
-# --------------------------------------------------
+def normalize_cell(value: Any) -> str:
+
+    if value is None:
+        return ""
+
+    return clean_text(
+        str(value).replace("\n", " ")
+    )
+
+
+# ==================================================
+# 3. HEADING DETECTION
+# ==================================================
 
 def is_heading(line: str) -> bool:
-    """
-    Identify common document headings.
-    """
 
     line = line.strip()
 
@@ -91,111 +89,77 @@ def is_heading(line: str) -> bool:
         r"^references\s*:?",
         r"^textbooks\s*:?",
         r"^contents\s*:?",
-        r"^syllabus\s*:?"
+        r"^syllabus\s*:?",
     ]
 
-    for pattern in patterns:
-
-        if re.match(
-            pattern,
-            line,
-            re.IGNORECASE
-        ):
-            return True
-
-    # Short uppercase headings.
-    if (
-        len(line) < 90
-        and line.isupper()
-        and len(line.split()) <= 12
+    if any(
+        re.match(pattern, line, re.IGNORECASE)
+        for pattern in patterns
     ):
         return True
 
-    return False
+    return (
+        len(line) < 90
+        and line.isupper()
+        and len(line.split()) <= 12
+    )
 
 
 def is_new_subject(line: str) -> bool:
-    """
-    Detect known subject titles.
-
-    Add more subject names here when needed.
-    """
-
-    line = line.strip()
-
-    if not line:
-        return False
 
     patterns = [
         r"^Introduction to Machine Learning$",
         r"^Operating Systems$",
         r"^Object Oriented Programming$",
         r"^Cloud Computing$",
-        r"^Introduction to Industrial Management.*$"
+        r"^Introduction to Industrial Management.*$",
     ]
 
     return any(
         re.match(
             pattern,
-            line,
+            line.strip(),
             re.IGNORECASE
         )
         for pattern in patterns
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # 4. REMOVE REPEATED HEADERS AND FOOTERS
-# --------------------------------------------------
+# ==================================================
 
-def remove_repeated_headers(pages_data: list) -> list:
-    """
-    Detect repeated lines near page boundaries
-    and remove them from the document.
-    """
+def remove_repeated_headers(pages_data):
 
     if len(pages_data) < 2:
         return pages_data
 
-    line_counts = Counter()
+    counts = Counter()
 
     for page_data in pages_data:
 
         lines = page_data["text"].splitlines()
 
-        candidate_lines = (
-            lines[:5] + lines[-3:]
-        )
+        candidates = lines[:5] + lines[-3:]
 
-        normalized_candidates = {
-            re.sub(
-                r"\s+",
-                " ",
-                line
-            ).strip().lower()
-
-            for line in candidate_lines
-
+        normalized = {
+            re.sub(r"\s+", " ", line).strip().lower()
+            for line in candidates
             if len(line.strip()) >= 10
         }
 
-        line_counts.update(normalized_candidates)
+        counts.update(normalized)
 
     threshold = max(
         2,
         ceil(len(pages_data) * 0.4)
     )
 
-    repeated_lines = {
+    repeated = {
         line
-        for line, count in line_counts.items()
+        for line, count in counts.items()
         if count >= threshold
     }
-
-    logger.info(
-        "Detected %s repeated header/footer lines.",
-        len(repeated_lines)
-    )
 
     for page_data in pages_data:
 
@@ -211,7 +175,7 @@ def remove_repeated_headers(pages_data: list) -> list:
                 range(len(lines) - 3, len(lines))
             )
 
-        cleaned_lines = []
+        cleaned = []
 
         for index, line in enumerate(lines):
 
@@ -223,122 +187,405 @@ def remove_repeated_headers(pages_data: list) -> list:
 
             if (
                 index in boundary_indices
-                and normalized in repeated_lines
+                and normalized in repeated
             ):
                 continue
 
-            cleaned_lines.append(line)
+            cleaned.append(line)
 
         page_data["text"] = clean_text(
-            "\n".join(cleaned_lines)
+            "\n".join(cleaned)
         )
 
     return pages_data
 
 
-# --------------------------------------------------
-# 5. STANDARD DIGITAL PDF EXTRACTION
-# --------------------------------------------------
+# ==================================================
+# 5. TABLE NORMALIZATION
+# ==================================================
 
-def extract_standard_pdf(pdf_path: str) -> list:
-    """
-    Extract selectable text using PyMuPDF.
-    """
+def normalize_table_rows(table):
 
-    pages_data = []
+    rows = []
 
-    with pymupdf.open(pdf_path) as doc:
+    for row in table or []:
 
-        for page_num, page in enumerate(doc):
+        normalized_row = [
+            normalize_cell(cell)
+            for cell in (row or [])
+        ]
 
-            text = clean_text(
-                page.get_text("text")
+        if any(normalized_row):
+            rows.append(normalized_row)
+
+    if not rows:
+        return []
+
+    column_count = max(
+        len(row) for row in rows
+    )
+
+    rows = [
+        row + [""] * (column_count - len(row))
+        for row in rows
+    ]
+
+    return rows
+
+
+# ==================================================
+# 6. SPECIAL HANDLING FOR TURNAROUND-TIME TABLE
+# ==================================================
+
+def normalize_turnaround_table(rows):
+
+    if not rows:
+        return rows
+
+    header_text = " ".join(rows[0]).lower()
+
+    is_turnaround_table = (
+        "service" in header_text
+        and (
+            "turn around" in header_text
+            or "turnaround" in header_text
+            or "maximum" in header_text
+        )
+    )
+
+    if not is_turnaround_table:
+        return rows
+
+    logger.info(
+        "Detected policyholder servicing turnaround-time table."
+    )
+
+    normalized = [
+        [
+            "Service Category",
+            "Service",
+            "Maximum Turn Around Time"
+        ]
+    ]
+
+    current_category = ""
+
+    for row in rows[1:]:
+
+        first = row[0].strip() if len(row) > 0 else ""
+        second = row[1].strip() if len(row) > 1 else ""
+
+        # A category row normally has a name in the
+        # first column and an empty second column.
+        if first and not second:
+
+            current_category = first
+
+            continue
+
+        # A normal service row has service text and
+        # turnaround time.
+        if first or second:
+
+            normalized.append([
+                current_category,
+                first,
+                second
+            ])
+
+    return normalized
+
+
+# ==================================================
+# 7. TABLE CONVERSION TO MARKDOWN
+# ==================================================
+
+def table_to_markdown(table):
+
+    rows = normalize_table_rows(table)
+
+    if not rows:
+        return ""
+
+    rows = normalize_turnaround_table(rows)
+
+    column_count = max(
+        len(row) for row in rows
+    )
+
+    rows = [
+        row + [""] * (column_count - len(row))
+        for row in rows
+    ]
+
+    markdown_rows = []
+
+    for index, row in enumerate(rows):
+
+        markdown_rows.append(
+            "| " + " | ".join(row) + " |"
+        )
+
+        if index == 0:
+
+            markdown_rows.append(
+                "| " + " | ".join(
+                    ["---"] * column_count
+                ) + " |"
             )
 
-            pages_data.append({
-                "page": page_num + 1,
-                "text": text,
-                "extraction_method": "digital"
-            })
-
-    return pages_data
+    return "\n".join(markdown_rows)
 
 
-# --------------------------------------------------
-# 6. OPTIONAL PDF TABLE EXTRACTION
-# --------------------------------------------------
+# ==================================================
+# 8. TABLE EXTRACTION
+# ==================================================
 
-def extract_pdf_with_tables(pdf_path: str) -> list:
-    """
-    Extract normal text and tables using pdfplumber.
+def score_extracted_tables(tables):
 
-    This is an optional extraction function.
-    The active smart extraction pipeline below
-    does not call this function yet.
-    """
+    total_score = 0
 
-    pages_data = []
+    for table in tables:
 
-    with pdfplumber.open(pdf_path) as pdf:
+        if not table:
+            continue
 
-        for page_num, page in enumerate(pdf.pages):
+        rows = normalize_table_rows(table)
 
-            page_content = []
+        if not rows:
+            continue
 
-            text = page.extract_text()
+        column_count = max(
+            len(row) for row in rows
+        )
 
-            if text:
-                page_content.append(
-                    clean_text(text)
+        nonempty_cells = sum(
+            bool(cell.strip())
+            for row in rows
+            for cell in row
+        )
+
+        paired_rows = sum(
+            sum(bool(cell.strip()) for cell in row) >= 2
+            for row in rows
+        )
+
+        score = (
+            len(rows) * 2
+            + nonempty_cells
+            + paired_rows * 3
+            + column_count * 5
+        )
+
+        # Give a preference to the target table
+        # when its header is detected.
+        header_text = " ".join(rows[0]).lower()
+
+        if (
+            "service" in header_text
+            and (
+                "turn around" in header_text
+                or "turnaround" in header_text
+                or "maximum" in header_text
+            )
+        ):
+            score += 100
+
+        total_score += score
+
+    return total_score
+
+
+def extract_tables_from_page(page):
+
+    strategies = [
+
+        # Strategy 1: Detect both vertical and horizontal lines.
+        {
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "lines",
+            "snap_tolerance": 3,
+            "join_tolerance": 3,
+            "intersection_tolerance": 5,
+            "edge_min_length": 10
+        },
+
+        # Strategy 2: Vertical lines and text-based rows.
+        {
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "text",
+            "snap_tolerance": 3,
+            "join_tolerance": 3,
+            "intersection_tolerance": 5,
+            "min_words_horizontal": 1
+        },
+
+        # Strategy 3: Text-based columns and horizontal lines.
+        {
+            "vertical_strategy": "text",
+            "horizontal_strategy": "lines",
+            "snap_tolerance": 3,
+            "join_tolerance": 3,
+            "intersection_tolerance": 5,
+            "min_words_vertical": 2
+        },
+
+        # Strategy 4: Text-based table detection.
+        {
+            "vertical_strategy": "text",
+            "horizontal_strategy": "text",
+            "snap_tolerance": 3,
+            "join_tolerance": 3,
+            "intersection_tolerance": 5,
+            "min_words_vertical": 2,
+            "min_words_horizontal": 1
+        },
+
+        # Strategy 5: Default pdfplumber settings.
+        None
+    ]
+
+    best_tables = []
+    best_score = -1
+
+    for strategy_index, settings in enumerate(strategies):
+
+        try:
+
+            if settings is None:
+
+                tables = page.extract_tables()
+
+            else:
+
+                tables = page.extract_tables(
+                    table_settings=settings
                 )
 
-            tables = page.extract_tables()
+            valid_tables = []
 
-            for table_num, table in enumerate(tables):
+            for table in tables or []:
 
-                page_content.append(
-                    f"Table {table_num + 1}:"
-                )
+                rows = normalize_table_rows(table)
 
-                for row in table:
+                if not rows:
+                    continue
 
-                    clean_row = []
+                # Ignore single-column extraction results.
+                if len(rows[0]) < 2:
+                    continue
 
-                    for cell in row:
+                valid_tables.append(rows)
 
-                        if cell is None:
-                            cell = ""
+            strategy_score = score_extracted_tables(
+                valid_tables
+            )
 
-                        cell = clean_text(
-                            str(cell).replace("\n", " ")
-                        )
+            logger.info(
+                "Table strategy %s: %s tables, score=%s",
+                strategy_index + 1,
+                len(valid_tables),
+                strategy_score
+            )
 
-                        clean_row.append(cell)
+            if (
+                valid_tables
+                and strategy_score > best_score
+            ):
 
-                    page_content.append(
-                        " | ".join(clean_row)
+                best_score = strategy_score
+                best_tables = valid_tables
+
+        except Exception:
+
+            logger.exception(
+                "Table extraction strategy %s failed.",
+                strategy_index + 1
+            )
+
+    if best_tables:
+
+        logger.info(
+            "Selected table extraction with score %s",
+            best_score
+        )
+
+    return best_tables
+
+
+# ==================================================
+# 9. EXTRACT TABLES FROM ALL PDF PAGES
+# ==================================================
+
+def extract_page_tables(pdf_path):
+
+    page_tables = {}
+
+    try:
+
+        with pdfplumber.open(pdf_path) as pdf:
+
+            for page_number, page in enumerate(
+                pdf.pages,
+                start=1
+            ):
+
+                tables = extract_tables_from_page(page)
+
+                if not tables:
+                    continue
+
+                entries = []
+
+                for index, table in enumerate(
+                    tables,
+                    start=1
+                ):
+
+                    markdown = table_to_markdown(table)
+
+                    if not markdown:
+                        continue
+
+                    logger.info(
+                        "PAGE %s TABLE %s:\n%s",
+                        page_number,
+                        index,
+                        markdown
                     )
 
-            final_text = "\n".join(page_content)
+                    entries.append({
 
-            pages_data.append({
-                "page": page_num + 1,
-                "text": clean_text(final_text),
-                "extraction_method": "digital_with_tables"
-            })
+                        "table_id": index,
 
-    return pages_data
+                        "text": markdown
+
+                    })
+
+                if entries:
+
+                    page_tables[page_number] = entries
+
+                    logger.info(
+                        "Page %s: extracted %s table(s)",
+                        page_number,
+                        len(entries)
+                    )
+
+    except Exception:
+
+        logger.exception(
+            "Could not extract tables from PDF."
+        )
+
+    return page_tables
 
 
-# --------------------------------------------------
-# 7. OCR EXTRACTION
-# --------------------------------------------------
+# ==================================================
+# 10. OCR
+# ==================================================
 
-def perform_ocr(page) -> str:
-    """
-    Convert a PDF page into an image
-    and extract text using Tesseract.
-    """
+def perform_ocr(page):
 
     pix = page.get_pixmap(
         dpi=300,
@@ -346,109 +593,81 @@ def perform_ocr(page) -> str:
         alpha=False
     )
 
-    img = Image.open(
-        io.BytesIO(
-            pix.tobytes("png")
-        )
+    image = Image.open(
+        io.BytesIO(pix.tobytes("png"))
     )
 
     text = pytesseract.image_to_string(
-        img,
+        image,
         config="--psm 3"
     )
 
     return clean_text(text)
 
 
-def extract_scanned_pdf(pdf_path: str) -> list:
-    """
-    Run OCR on every page of a scanned PDF.
-    """
+def needs_ocr(text):
 
-    pages_data = []
-
-    with pymupdf.open(pdf_path) as doc:
-
-        for page_num, page in enumerate(doc):
-
-            logger.info(
-                "Running OCR on page %s",
-                page_num + 1
-            )
-
-            text = perform_ocr(page)
-
-            pages_data.append({
-                "page": page_num + 1,
-                "text": text,
-                "extraction_method": "ocr"
-            })
-
-    return pages_data
-
-
-# --------------------------------------------------
-# 8. OCR QUALITY CHECK
-# --------------------------------------------------
-
-def needs_ocr(text: str) -> bool:
-    """
-    Decide whether digital extraction produced
-    sufficiently useful text.
-    """
-
-    if not text:
+    if not text or len(text.strip()) < 30:
         return True
 
-    text = text.strip()
-
-    if len(text) < 30:
-        return True
-
-    meaningful_chars = sum(
+    meaningful = sum(
         char.isalnum()
         for char in text
     )
 
-    ratio = meaningful_chars / len(text)
+    ratio = meaningful / max(len(text), 1)
 
     return ratio < 0.50
 
 
-# --------------------------------------------------
-# 9. HYBRID SMART EXTRACTION
-# --------------------------------------------------
+# ==================================================
+# 11. SMART PDF EXTRACTION
+# ==================================================
 
-def smart_extract_pdf(pdf_path: str) -> list:
-    """
-    First attempt digital extraction.
-    Use OCR when digital text is weak.
-    """
+def smart_extract_pdf(pdf_path):
 
     pages_data = []
 
+    # Extract tables separately using pdfplumber.
+    page_tables = extract_page_tables(pdf_path)
+
     with pymupdf.open(pdf_path) as doc:
 
-        for page_num, page in enumerate(doc):
+        for page_number, page in enumerate(
+            doc,
+            start=1
+        ):
 
+            tables = page_tables.get(
+                page_number,
+                []
+            )
+
+            # Extract complete digital page text.
+            # Do not use mismatched table bounding boxes:
+            # they can accidentally remove normal text.
             text = clean_text(
-                page.get_text("text")
+                page.get_text(
+                    "text",
+                    sort=True
+                )
             )
 
             method = "digital"
 
+            # OCR fallback for weak digital text.
             if needs_ocr(text):
 
                 logger.info(
-                    "Page %s: Weak digital text. Running OCR.",
-                    page_num + 1
+                    "Digital text is weak on page %s. Running OCR.",
+                    page_number
                 )
 
                 try:
 
                     ocr_text = perform_ocr(page)
 
-                    if len(ocr_text) > len(text):
+                    if len(ocr_text.strip()) > len(text.strip()):
 
                         text = ocr_text
                         method = "ocr"
@@ -461,83 +680,103 @@ def smart_extract_pdf(pdf_path: str) -> list:
 
                     logger.exception(
                         "OCR failed on page %s",
-                        page_num + 1
+                        page_number
                     )
 
                     method = "digital_fallback"
 
-            else:
-
-                logger.info(
-                    "Page %s: Digital extraction successful.",
-                    page_num + 1
-                )
-
             pages_data.append({
-                "page": page_num + 1,
-                "text": text,
+
+                "page": page_number,
+
+                "text": clean_text(text),
+
+                "tables": tables,
+
                 "extraction_method": method
+
             })
 
-    pages_data = remove_repeated_headers(
-        pages_data
-    )
+            logger.info(
+                "Page %s: extracted %s characters using %s",
+                page_number,
+                len(text),
+                method
+            )
 
-    return pages_data
+    return remove_repeated_headers(pages_data)
 
 
-# --------------------------------------------------
-# 10. CONVERT PAGE DATA INTO ONE STRING
-# --------------------------------------------------
+# ==================================================
+# 12. EXTRACT PDF AS PLAIN TEXT
+# ==================================================
 
-def pages_to_text(pages_data: list) -> str:
-    """
-    Convert extracted page data into one string.
-    """
+def pages_to_text(pages_data):
 
-    full_text = []
+    output = []
 
     for page_data in pages_data:
 
-        page_num = page_data["page"]
-        text = page_data["text"]
+        page_number = page_data["page"]
 
-        full_text.append(
-            f"\n--- Page {page_num} ---\n{text}"
+        output.append(
+            f"\n--- Page {page_number} ---"
         )
 
-    return "\n".join(full_text)
+        output.append(
+            page_data.get("text", "")
+        )
+
+        for table in page_data.get("tables", []):
+
+            output.append(
+                f"\n[TABLE {table['table_id']}]\n"
+                f"{table['text']}"
+            )
+
+    return "\n".join(output)
 
 
-# --------------------------------------------------
-# 11. EXTRACT PDF AND RETURN PLAIN TEXT
-# --------------------------------------------------
-
-def extract_pdf_text(pdf_path: str) -> str:
+def extract_pdf_text(pdf_path):
 
     pages_data = smart_extract_pdf(pdf_path)
 
     return pages_to_text(pages_data)
 
 
-# --------------------------------------------------
-# 12. EXTRACT PARAGRAPHS
-# --------------------------------------------------
+# ==================================================
+# 13. FAQ-AWARE PARAGRAPH EXTRACTION
+# ==================================================
 
-def extract_paragraphs(text: str) -> list:
-    """
-    Preserve paragraph, heading and numbered-list
-    boundaries instead of joining everything blindly.
-    """
+FAQ_QUESTION_PATTERN = re.compile(
+    r"^\s*(?:Q\s*\.|Question\s*[:.]?)\s*",
+    re.IGNORECASE
+)
 
-    lines = text.splitlines()
+FAQ_ANSWER_PATTERN = re.compile(
+    r"^\s*(?:Ans\s*\.?|Answer\s*[:.]?)\s*",
+    re.IGNORECASE
+)
 
-    paragraphs = []
+LIST_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"\d+\s*[.)]"
+    r"|[•●▪◦‣]"
+    r"|[-–—]\s+"
+    r")\s*"
+)
+
+
+def extract_paragraphs(text):
+
+    blocks = []
+
     current = []
+    faq_current = []
+    list_current = []
 
-    list_pattern = re.compile(
-        r"^\s*(?:\d+[.)]\s+|[•●▪\-]\s+)"
-    )
+    inside_faq = False
+    inside_list = False
 
     def save_current():
 
@@ -545,73 +784,154 @@ def extract_paragraphs(text: str) -> list:
 
         if current:
 
-            paragraphs.append(
-                " ".join(current).strip()
-            )
+            block = "\n".join(current).strip()
+
+            if block:
+                blocks.append(block)
 
             current = []
 
-    for line in lines:
+    def save_list():
 
-        line = line.strip()
+        nonlocal list_current, inside_list
+
+        if list_current:
+
+            block = "\n".join(list_current).strip()
+
+            if block:
+                blocks.append(block)
+
+            list_current = []
+
+        inside_list = False
+
+    def save_faq():
+
+        nonlocal faq_current, inside_faq
+
+        if faq_current:
+
+            block = "\n".join(faq_current).strip()
+
+            if block:
+                blocks.append(block)
+
+            faq_current = []
+
+        inside_faq = False
+
+    for raw_line in text.splitlines():
+
+        line = raw_line.strip()
 
         if not line:
 
-            save_current()
+            if inside_faq:
+
+                faq_current.append("")
+
+            else:
+
+                save_list()
+                save_current()
+
             continue
 
-        # Keep headings separate.
+        # Start a new FAQ.
+        if FAQ_QUESTION_PATTERN.match(line):
+
+            save_faq()
+            save_list()
+            save_current()
+
+            faq_current = [line]
+            inside_faq = True
+
+            continue
+
+        # Close FAQ when a heading is detected.
+        if inside_faq and is_heading(line):
+
+            save_faq()
+
+            blocks.append(line)
+
+            continue
+
+        # Keep the answer and its bullets together.
+        if inside_faq:
+
+            faq_current.append(line)
+
+            continue
+
+        # Handle headings.
         if is_heading(line):
 
+            save_list()
             save_current()
-            paragraphs.append(line)
+
+            blocks.append(line)
+
             continue
 
-        # Keep each numbered or bulleted item separate.
-        if list_pattern.match(line):
+        # Handle bullet and numbered lists.
+        if LIST_PATTERN.match(line):
 
             save_current()
-            paragraphs.append(line)
+
+            inside_list = True
+
+            list_current.append(line)
+
+            continue
+
+        # Preserve wrapped lines in a list.
+        if inside_list:
+
+            list_current.append(line)
+
             continue
 
         current.append(line)
 
+    save_faq()
+    save_list()
     save_current()
 
-    return paragraphs
+    return blocks
 
 
-# --------------------------------------------------
-# 13. SPLIT TEXT INTO SENTENCES
-# --------------------------------------------------
+# ==================================================
+# 14. SENTENCE SPLITTING
+# ==================================================
 
-def split_sentences(text: str) -> list:
-    """
-    Split sentences while protecting common
-    abbreviations, decimal numbers and list markers.
-    """
+def split_sentences(text):
 
     if not text.strip():
         return []
 
     protected = text
 
-    protected_tokens = {}
+    tokens = {}
 
-    def protect(pattern, replacement_function=None):
+    abbreviations = [
+        "Mr.", "Mrs.", "Ms.", "Dr.",
+        "Prof.", "Sr.", "Jr.",
+        "e.g.", "i.e.", "etc.",
+        "vs.", "No.", "Fig.", "Dept."
+    ]
+
+    def protect(pattern):
 
         nonlocal protected
 
         def replace_match(match):
 
-            token = f"PROTECTEDTOKEN{len(protected_tokens)}X"
+            token = f"PROTECTEDTOKEN{len(tokens)}X"
 
-            original = match.group(0)
-
-            if replacement_function:
-                original = replacement_function(match)
-
-            protected_tokens[token] = original
+            tokens[token] = match.group(0)
 
             return token
 
@@ -622,33 +942,13 @@ def split_sentences(text: str) -> list:
             flags=re.IGNORECASE
         )
 
-    # Protect common abbreviations.
-    abbreviations = [
-        "Mr.", "Mrs.", "Ms.", "Dr.", "Prof.",
-        "Sr.", "Jr.", "e.g.", "i.e.", "etc.",
-        "vs.", "No.", "Fig.", "Dept.", "Ed."
-    ]
-
     for abbreviation in abbreviations:
 
-        protect(
-            re.escape(abbreviation)
-        )
+        protect(re.escape(abbreviation))
 
-    # Protect decimal points, e.g. 3.14.
-    protect(
-        r"(?<=\d)\.(?=\d)"
-    )
+    protect(r"(?<=\d)\.(?=\d)")
 
-    # Protect initials, e.g. A. Kumar.
-    protect(
-        r"\b[A-Z]\.(?=\s*[A-Z])"
-    )
-
-    # Protect numbered list markers, e.g. 1. First item.
-    protect(
-        r"(?m)^\s*\d+\.(?=\s)"
-    )
+    protect(r"\b[A-Z]\.(?=\s*[A-Z])")
 
     sentences = re.split(
         r"(?<=[.!?])\s+",
@@ -659,8 +959,7 @@ def split_sentences(text: str) -> list:
 
     for sentence in sentences:
 
-        # Restore protected text.
-        for token, original in protected_tokens.items():
+        for token, original in tokens.items():
 
             sentence = sentence.replace(
                 token,
@@ -675,21 +974,11 @@ def split_sentences(text: str) -> list:
     return results
 
 
-# --------------------------------------------------
-# 14. CREATE DOCUMENT SEGMENTS
-# --------------------------------------------------
+# ==================================================
+# 15. CREATE SEGMENTS
+# ==================================================
 
-def create_segments(pages_data: list) -> list:
-    """
-    Convert pages into ordered segments.
-
-    Each segment stores:
-    - text
-    - page number
-    - subject
-    - segment type
-    - extraction method
-    """
+def create_segments(pages_data):
 
     segments = []
 
@@ -705,7 +994,7 @@ def create_segments(pages_data: list) -> list:
         )
 
         paragraphs = extract_paragraphs(
-            page_data["text"]
+            page_data.get("text", "")
         )
 
         for paragraph in paragraphs:
@@ -715,127 +1004,199 @@ def create_segments(pages_data: list) -> list:
             if not paragraph:
                 continue
 
-            # Detect a new subject.
+            # Subject heading.
             if is_new_subject(paragraph):
 
                 current_subject = paragraph
 
                 segments.append({
+
                     "text": paragraph,
+
                     "page": page_number,
+
                     "subject": current_subject,
+
                     "type": "subject_heading",
+
                     "extraction_method": extraction_method
+
                 })
 
                 continue
 
-            # Detect a normal heading.
+            # Normal heading.
             if is_heading(paragraph):
 
                 segments.append({
+
                     "text": paragraph,
+
                     "page": page_number,
+
                     "subject": current_subject,
+
                     "type": "heading",
+
                     "extraction_method": extraction_method
+
                 })
 
                 continue
 
-            sentences = split_sentences(paragraph)
-
-            for sentence in sentences:
-
-                if not sentence.strip():
-                    continue
+            # Keep FAQ question and answer together.
+            if FAQ_QUESTION_PATTERN.match(paragraph):
 
                 segments.append({
-                    "text": sentence,
+
+                    "text": paragraph,
+
                     "page": page_number,
+
                     "subject": current_subject,
-                    "type": "content",
+
+                    "type": "faq",
+
                     "extraction_method": extraction_method
+
                 })
 
+                continue
+
+            # Keep complete lists together.
+            if LIST_PATTERN.match(paragraph):
+
+                segments.append({
+
+                    "text": paragraph,
+
+                    "page": page_number,
+
+                    "subject": current_subject,
+
+                    "type": "list",
+
+                    "extraction_method": extraction_method
+
+                })
+
+                continue
+
+            # Split normal content into sentences.
+            for sentence in split_sentences(paragraph):
+
+                if sentence.strip():
+
+                    segments.append({
+
+                        "text": sentence,
+
+                        "page": page_number,
+
+                        "subject": current_subject,
+
+                        "type": "content",
+
+                        "extraction_method": extraction_method
+
+                    })
+
+        # Add extracted tables separately.
+        for table in page_data.get("tables", []):
+
+            table_text = table["text"].strip()
+
+            if not table_text:
+                continue
+
+            segments.append({
+
+                "text": (
+                    f"Table {table['table_id']} "
+                    f"on page {page_number}:\n"
+                    f"{table_text}"
+                ),
+
+                "page": page_number,
+
+                "subject": current_subject,
+
+                "type": "table",
+
+                "table_id": table["table_id"],
+
+                "extraction_method": "pdfplumber_table"
+
+            })
+
     logger.info(
-        "Created %s text segments.",
+        "Created %s segments",
         len(segments)
     )
 
     return segments
 
 
-# --------------------------------------------------
-# 15. DYNAMIC CHUNK SETTINGS
-# --------------------------------------------------
+# ==================================================
+# 16. DYNAMIC CHUNK SETTINGS
+# ==================================================
 
-def get_dynamic_chunk_settings(segments: list) -> dict:
-    """
-    Calculate chunk size from average segment length.
-    """
+def get_dynamic_chunk_settings(segments):
 
     lengths = [
+
         len(segment["text"])
+
         for segment in segments
-        if segment["text"].strip()
+
+        if segment.get("text", "").strip()
+
+        and segment.get("type") != "table"
+
     ]
 
     if not lengths:
 
-        return {
-            "chunk_size": 850,
-            "overlap_chars": 127
-        }
-
-    average_length = (
-        sum(lengths) / len(lengths)
-    )
-
-    if average_length < 150:
-
-        chunk_size = 700
-
-    elif average_length < 350:
-
-        chunk_size = 850
-
-    elif average_length < 600:
-
-        chunk_size = 1000
+        chunk_size = 900
 
     else:
 
-        chunk_size = 1200
+        average_length = (
+            sum(lengths) / len(lengths)
+        )
 
-    overlap_chars = int(
-        chunk_size * 0.15
-    )
+        if average_length < 150:
 
-    settings = {
+            chunk_size = 700
+
+        elif average_length < 350:
+
+            chunk_size = 850
+
+        elif average_length < 600:
+
+            chunk_size = 1000
+
+        else:
+
+            chunk_size = 1200
+
+    return {
+
         "chunk_size": chunk_size,
-        "overlap_chars": overlap_chars
+
+        "overlap_chars": int(
+            chunk_size * 0.15
+        )
+
     }
 
-    logger.info(
-        "Dynamic chunk settings: %s",
-        settings
-    )
 
-    return settings
+# ==================================================
+# 17. SPLIT LONG TEXT
+# ==================================================
 
-
-# --------------------------------------------------
-# 16. SPLIT LONG SEGMENTS
-# --------------------------------------------------
-
-def split_long_segment(
-    text: str,
-    max_size: int
-) -> list:
-    """
-    Split a long segment at word boundaries.
-    """
+def split_long_segment(text, max_size):
 
     if len(text) <= max_size:
         return [text]
@@ -845,19 +1206,18 @@ def split_long_segment(
     result = []
 
     current = []
+
     current_length = 0
 
     for word in words:
 
-        required_length = len(word)
-
-        if current:
-
-            required_length += 1
+        needed = len(word) + (
+            1 if current else 0
+        )
 
         if (
             current
-            and current_length + required_length > max_size
+            and current_length + needed > max_size
         ):
 
             result.append(
@@ -865,11 +1225,14 @@ def split_long_segment(
             )
 
             current = []
+
             current_length = 0
 
         current.append(word)
 
-        current_length += len(word) + 1
+        current_length += len(word) + (
+            1 if len(current) > 1 else 0
+        )
 
     if current:
 
@@ -880,26 +1243,92 @@ def split_long_segment(
     return result
 
 
-# --------------------------------------------------
-# 17. DOCUMENT-LEVEL CHUNKING
-# --------------------------------------------------
+# ==================================================
+# 18. SPLIT LARGE TABLES BY ROWS
+# ==================================================
+
+def split_large_table(table_text, max_size):
+
+    lines = table_text.splitlines()
+
+    if len(table_text) <= max_size or len(lines) < 3:
+        return [table_text]
+
+    header = lines[0]
+
+    separator = (
+        lines[1]
+        if lines[1].startswith("|")
+        else ""
+    )
+
+    data_rows = (
+        lines[2:]
+        if separator
+        else lines[1:]
+    )
+
+    prefix_lines = [header]
+
+    if separator:
+        prefix_lines.append(separator)
+
+    prefix = "\n".join(prefix_lines)
+
+    chunks = []
+
+    current_rows = []
+
+    for row in data_rows:
+
+        candidate = "\n".join(
+            [prefix] + current_rows + [row]
+        )
+
+        if (
+            current_rows
+            and len(candidate) > max_size
+        ):
+
+            chunks.append(
+                "\n".join(
+                    [prefix] + current_rows
+                )
+            )
+
+            current_rows = [row]
+
+        else:
+
+            current_rows.append(row)
+
+    if current_rows:
+
+        chunks.append(
+            "\n".join(
+                [prefix] + current_rows
+            )
+        )
+
+    return chunks
+
+
+# ==================================================
+# 19. FINAL CHUNK CREATION
+# ==================================================
 
 def chunk_segments(
-    segments: list,
-    chunk_size: int,
-    overlap_chars: int
-) -> list:
-    """
-    Create chunks across the complete document.
-
-    Chunks can span multiple pages, but they cannot
-    mix different subjects.
-    """
+    segments,
+    chunk_size,
+    overlap_chars
+):
 
     chunks = []
 
     current = []
+
     current_length = 0
+
     current_subject = None
 
     def save_chunk(items):
@@ -913,85 +1342,186 @@ def chunk_segments(
         })
 
         methods = sorted({
-            item["extraction_method"]
+            item.get(
+                "extraction_method",
+                "unknown"
+            )
             for item in items
         })
 
+        types = {
+            item.get("type", "content")
+            for item in items
+        }
+
+        if "faq" in types:
+
+            content_type = "faq"
+
+        elif "list" in types:
+
+            content_type = "list"
+
+        elif types == {"table"}:
+
+            content_type = "table"
+
+        else:
+
+            content_type = "text"
+
         chunks.append({
+
             "text": "\n".join(
                 item["text"]
                 for item in items
             ),
+
             "page_start": min(pages),
+
             "page_end": max(pages),
+
             "pages": pages,
+
             "subject": items[0].get("subject"),
+
+            "content_type": content_type,
+
+            "table_id": (
+                items[0].get("table_id")
+                if content_type == "table"
+                else None
+            ),
+
             "extraction_method": (
                 methods[0]
                 if len(methods) == 1
                 else "mixed"
             )
+
         })
+
+    def make_overlap(previous):
+
+        overlap = []
+
+        overlap_length = 0
+
+        for item in reversed(previous):
+
+            if item.get("type") != "content":
+                continue
+
+            item_length = len(item["text"]) + 1
+
+            if (
+                overlap_length + item_length
+                > overlap_chars
+            ):
+                break
+
+            overlap.insert(0, item)
+
+            overlap_length += item_length
+
+        return overlap
 
     for segment in segments:
 
-        text = segment["text"]
-
         subject = segment.get("subject")
 
-        # Start a new chunk when the subject changes.
+        segment_type = segment.get(
+            "type",
+            "content"
+        )
+
+        # Start a new chunk when subject changes.
         if current and subject != current_subject:
 
             save_chunk(current)
 
             current = []
+
             current_length = 0
 
         current_subject = subject
 
+        # Every FAQ gets its own chunk.
+        if segment_type == "faq":
+
+            if current:
+
+                save_chunk(current)
+
+                current = []
+
+                current_length = 0
+
+            save_chunk([segment])
+
+            continue
+
+        # Keep lists independent.
+        if segment_type == "list":
+
+            if current:
+
+                save_chunk(current)
+
+                current = []
+
+                current_length = 0
+
+            save_chunk([segment])
+
+            continue
+
+        # Keep tables independent.
+        if segment_type == "table":
+
+            if current:
+
+                save_chunk(current)
+
+                current = []
+
+                current_length = 0
+
+            table_pieces = split_large_table(
+                segment["text"],
+                chunk_size
+            )
+
+            for piece in table_pieces:
+
+                save_chunk([{
+                    **segment,
+                    "text": piece
+                }])
+
+            continue
+
         pieces = split_long_segment(
-            text,
+            segment["text"],
             chunk_size
         )
 
         for piece in pieces:
 
-            required_length = len(piece) + 1
+            needed = len(piece) + (
+                1 if current else 0
+            )
 
-            # Check whether the piece fits.
             if (
                 current
-                and current_length + required_length > chunk_size
+                and current_length + needed > chunk_size
             ):
 
                 previous = current.copy()
 
                 save_chunk(previous)
 
-                # Build overlap from complete content segments.
-                overlap = []
-                overlap_length = 0
-
-                for item in reversed(previous):
-
-                    if item.get("type") != "content":
-                        continue
-
-                    item_length = (
-                        len(item["text"]) + 1
-                    )
-
-                    if (
-                        overlap_length + item_length
-                        > overlap_chars
-                    ):
-                        break
-
-                    overlap.insert(0, item)
-
-                    overlap_length += item_length
-
-                current = overlap
+                current = make_overlap(previous)
 
                 current_length = sum(
                     len(item["text"]) + 1
@@ -999,81 +1529,79 @@ def chunk_segments(
                 )
 
             current.append({
+
                 **segment,
+
                 "text": piece
+
             })
 
-            current_length += required_length
+            current_length += len(piece) + 1
 
-    # Save the last chunk.
     if current:
 
         save_chunk(current)
 
-    # Add unique chunk IDs.
+    # Assign unique chunk IDs.
     for chunk_id, chunk in enumerate(chunks):
 
         chunk["chunk_id"] = chunk_id
 
     logger.info(
-        "Created %s final chunks.",
+        "Created %s final chunks",
         len(chunks)
     )
 
     return chunks
 
 
-# --------------------------------------------------
-# 18. COMPLETE PDF PROCESSING PIPELINE
-# --------------------------------------------------
+# ==================================================
+# 20. COMPLETE PDF PROCESSING PIPELINE
+# ==================================================
 
-def extract_and_chunk_pdf(pdf_path: str) -> list:
-    """
-    Complete pipeline:
+def extract_and_chunk_pdf(pdf_path):
 
-    1. Extract PDF pages.
-    2. Clean extracted text.
-    3. Detect paragraphs and headings.
-    4. Create segments.
-    5. Calculate dynamic chunk settings.
-    6. Create document-level chunks.
-    """
-
-    # Step 1: Extract pages.
-    pages_data = smart_extract_pdf(
+    logger.info(
+        "Starting PDF processing: %s",
         pdf_path
     )
 
-    # Step 2: Create document segments.
-    segments = create_segments(
-        pages_data
-    )
+    # Step 1: Extract digital text, OCR text and tables.
+    pages_data = smart_extract_pdf(pdf_path)
 
-    # Step 3: Calculate dynamic settings.
+    # Step 2: Create FAQ, list, text and table segments.
+    segments = create_segments(pages_data)
+
+    # Step 3: Calculate chunk settings.
     settings = get_dynamic_chunk_settings(
         segments
     )
 
-    chunk_size = settings["chunk_size"]
-
-    overlap_chars = settings["overlap_chars"]
-
     # Step 4: Create final chunks.
     chunks = chunk_segments(
+
         segments=segments,
-        chunk_size=chunk_size,
-        overlap_chars=overlap_chars
+
+        chunk_size=settings["chunk_size"],
+
+        overlap_chars=settings["overlap_chars"]
+
     )
 
-    # Step 5: Attach settings to every chunk.
+    # Step 5: Add chunk configuration metadata.
     for chunk in chunks:
 
-        chunk["chunk_size_setting"] = chunk_size
+        chunk["chunk_size_setting"] = (
+            settings["chunk_size"]
+        )
 
-        chunk["overlap_setting"] = overlap_chars
+        chunk["overlap_setting"] = (
+            settings["overlap_chars"]
+        )
 
     logger.info(
-        "PDF processing completed. Pages: %s, Segments: %s, Chunks: %s",
+        "PDF processing completed. "
+        "Pages: %s, Segments: %s, Chunks: %s",
         len(pages_data),
         len(segments),
         len(chunks)
